@@ -1,0 +1,187 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        WEB_APP_REPO = "${ECR_REGISTRY}/microservices-web-app"
+        ADMIN_API_REPO = "${ECR_REGISTRY}/microservices-admin-api"
+        TF_VAR_environment = "${env.BRANCH_NAME == 'main' ? 'production' : 'dev'}"
+        // Store previous build number for rollback; define how to populate this in your environment
+        PREVIOUS_BUILD_NUMBER = '123' 
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Security Scan') {
+            parallel {
+                stage('Code Quality') {
+                    steps {
+                        sh 'terraform fmt -check -recursive'
+                        sh 'terraform validate'
+                    }
+                }
+                stage('Secret Scan') {
+                    steps {
+                        sh 'trufflehog git https://github.com/your-repo/microservices-app.git'
+                    }
+                }
+            }
+        }
+        
+        stage('Build Images') {
+            parallel {
+                stage('Web App') {
+                    steps {
+                        script {
+                            def webAppImage = docker.build("${WEB_APP_REPO}:${BUILD_NUMBER}", 
+                                "./ci-cd/docker/web-app")
+                            
+                            docker.withRegistry("https://${ECR_REGISTRY}", 'ecr:ap-south-1:aws-credentials') {
+                                webAppImage.push("${BUILD_NUMBER}")
+                                webAppImage.push("latest")
+                            }
+                        }
+                    }
+                }
+                stage('Admin API') {
+                    steps {
+                        script {
+                            def adminApiImage = docker.build("${ADMIN_API_REPO}:${BUILD_NUMBER}", 
+                                "./ci-cd/docker/admin-api")
+                            
+                            docker.withRegistry("https://${ECR_REGISTRY}", 'ecr:ap-south-1:aws-credentials') {
+                                adminApiImage.push("${BUILD_NUMBER}")
+                                adminApiImage.push("latest")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                dir("environments/${TF_VAR_environment}") {
+                    sh 'terraform init'
+                    sh 'terraform plan -out=tfplan'
+                    archiveArtifacts artifacts: 'tfplan', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Security Review') {
+            when {
+                branch 'main'
+            }
+            steps {
+                dir("environments/${TF_VAR_environment}") {
+                    sh 'checkov -f tfplan --framework terraform_plan'
+                }
+            }
+        }
+        
+        stage('Deploy Infrastructure') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                dir("environments/${TF_VAR_environment}") {
+                    sh 'terraform apply tfplan'
+                }
+                
+                script {
+                    env.ALB_DNS = sh(
+                        script: "cd environments/${TF_VAR_environment} && terraform output -raw alb_dns_name",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Update ECS Services') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                sh '''
+                    aws ecs update-service \
+                        --cluster microservices-cluster \
+                        --service microservices-web-app \
+                        --force-new-deployment
+                        
+                    aws ecs update-service \
+                        --cluster microservices-cluster \
+                        --service microservices-admin-api \
+                        --force-new-deployment
+                '''
+            }
+        }
+
+        stage('Rollback') {
+            when {
+                expression { currentBuild.result == 'FAILURE' }
+            }
+            steps {
+                sh "./scripts/rollback.sh ${TF_VAR_environment} ${PREVIOUS_BUILD_NUMBER}"
+            }
+        }
+        
+        stage('Health Check') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        waitUntil {
+                            script {
+                                def response = sh(
+                                    script: "curl -s -o /dev/null -w '%{http_code}' http://${env.ALB_DNS}/health",
+                                    returnStdout: true
+                                ).trim()
+                                return response == '200'
+                            }
+                        }
+                    }
+                }
+                
+                echo "Deployment successful! Application is healthy at http://${env.ALB_DNS}"
+            }
+        }
+    }
+    
+    post {
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ Deployment SUCCESS: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Deployment FAILED: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
