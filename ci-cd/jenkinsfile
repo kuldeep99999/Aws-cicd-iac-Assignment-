@@ -28,7 +28,7 @@ pipeline {
                 }
                 stage('Secret Scan') {
                     steps {
-                        sh 'trufflehog git https://github.com/your-repo/microservices-app.git'
+                        sh 'trufflehog git https://github.com/your-repo/Aws-cicd-iac-Assignment-.git'
                     }
                 }
             }
